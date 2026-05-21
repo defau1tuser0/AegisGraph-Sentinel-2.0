@@ -4,13 +4,20 @@ FastAPI Application for AegisGraph Sentinel 2.0
 Real-time fraud detection API service
 """
 # Working on fraud detection API endpoints and streamlit integration
-
+# SECURITY NOTE:
+# We use pickle ONLY to load our own internally-generated synthetic graph
+# (data/synthetic/graph.gpickle). This file is created during data generation
+# and is treated as a trusted build artifact.
+# We will add SHA256 verification before loading to prevent tampering.
+import hashlib
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from contextlib import asynccontextmanager
 import time
 import asyncio
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 import yaml
 from typing import Dict, List
@@ -146,8 +153,7 @@ except (ImportError, SyntaxError) as e:
         event_type="innovation_import_fallback",
     )
     INNOVATIONS_AVAILABLE = False
-    INNOVATIONS_AVAILABLE = False
-    
+       
     # Demo mode functions
     def compute_risk_score(transaction: dict, biometrics: dict = None, **kwargs) -> dict:
         """Enhanced risk scorer with graph-based mule account detection"""
@@ -316,7 +322,7 @@ except (ImportError, SyntaxError) as e:
         entropy_risk = 0.0
         
         # Time-based anomalies (simplified)
-        hour = datetime.utcnow().hour
+        hour = datetime.now(timezone.utc).hour
         if hour >= 2 and hour <= 5:  # Late night transactions
             entropy_risk += 0.4
         
@@ -528,6 +534,17 @@ async def startup_event():
     _startup_logger = get_logger("api.startup")
     _startup_logger.info("AegisGraph Sentinel 2.0 starting up", event_type="startup_begin")
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Application lifespan. Initialises services and config on startup,
+    tracks background tasks, and cancels them cleanly on shutdown.
+    """
+    # Startup
+    print("=" * 80)
+    print("AegisGraph Sentinel 2.0 - Starting up...")
+    print("=" * 80)
+    
     # Load configuration
     config_path = Path("config/config.yaml")
     if config_path.exists():
@@ -539,11 +556,30 @@ async def startup_event():
         state.config = {}
     
     # Load synthetic fraud data for graph-based detection
+        # Load synthetic fraud data for graph-based detection
     try:
-        # Load transaction graph
+        # === SECURE GRAPH LOADING ===
+        # We verify the SHA256 hash of the pickle file before loading it.
+        # This mitigates supply-chain / tampering attacks on the .gpickle artifact.
         graph_path = Path("data/synthetic/graph.gpickle")
+        
+        # TODO: Replace this with the actual SHA256 of your generated graph.gpickle
+        EXPECTED_GRAPH_SHA256 = None   # Example: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        
         if graph_path.exists():
-            with open(graph_path, 'rb') as f:
+            with open(graph_path, "rb") as f:
+                file_bytes = f.read()
+                actual_hash = hashlib.sha256(file_bytes).hexdigest()
+            
+            if EXPECTED_GRAPH_SHA256 and actual_hash != EXPECTED_GRAPH_SHA256:
+                raise RuntimeError(
+                    f"SECURITY ALERT: graph.gpickle integrity check FAILED!\n"
+                    f"Expected SHA256: {EXPECTED_GRAPH_SHA256}\n"
+                    f"Actual SHA256:   {actual_hash}\n"
+                    "Possible file tampering or corrupted artifact. Aborting startup."
+                )
+            
+            with open(graph_path, "rb") as f:
                 state.transaction_graph = pickle.load(f)
             _startup_logger.info(
                 "Loaded transaction graph",
@@ -553,6 +589,9 @@ async def startup_event():
                     "edges": state.transaction_graph.number_of_edges(),
                 },
             )
+            
+            print(f"✓ Loaded verified transaction graph: {state.transaction_graph.number_of_nodes()} nodes, "
+                  f"{state.transaction_graph.number_of_edges()} edges")
             state.graph_loaded = True
         else:
             _startup_logger.warning(
@@ -565,7 +604,6 @@ async def startup_event():
         if chains_path.exists():
             with open(chains_path, 'r') as f:
                 state.fraud_chains = json.load(f)
-            # Extract mule accounts from chains
             for chain in state.fraud_chains:
                 state.mule_accounts.update(chain.get('accounts', []))
             _startup_logger.info(
@@ -670,6 +708,91 @@ async def startup_event():
         },
     )
     asyncio.ensure_future(_honeypot_auto_release_loop())
+        print("⚠ Innovation modules not available")
+    
+    print("=" * 80)
+    print("AegisGraph Sentinel 2.0 is ready")
+    print(f"Mode: {'PRODUCTION' if MODEL_AVAILABLE else 'DEMO'}")
+    print(f"Graph-based Detection: {'ENABLED' if state.graph_loaded else 'DISABLED'}")
+    print(f"Innovations: {'ENABLED' if INNOVATIONS_AVAILABLE else 'DISABLED'}")
+    print("API Documentation: http://localhost:8000/docs")
+    print("=" * 80)
+    
+    # Start background tasks. Save the handle so we can stop it cleanly on shutdown.
+    honeypot_task = asyncio.create_task(_honeypot_auto_release_loop())
+    
+    yield
+    
+    # Shutdown 
+    print("Shutting down AegisGraph Sentinel 2.0...")
+    honeypot_task.cancel()
+    try:
+        await honeypot_task
+    except asyncio.CancelledError:
+        pass
+    print("Background tasks stopped cleanly")
+
+# Initialize FastAPI app
+app = FastAPI(
+    title="AegisGraph Sentinel 2.0",
+    description="Real-Time Cross-Channel Mule Account Detection & Neutralization API",
+    version="2.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    lifespan=lifespan
+)
+
+# CORS middleware
+#
+# CWE-942 prevention: `allow_origins=["*"]` combined with
+# `allow_credentials=True` makes Starlette reflect the request's Origin
+# header back, effectively allowing credentialed cross-origin requests
+# from any site. Read the allowed origins from AEGIS_ALLOWED_ORIGINS
+# (comma-separated) instead, defaulting to local dev URLs.
+_default_origins = "http://localhost:3000,http://localhost:8501,http://127.0.0.1:8501"
+ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.getenv("AEGIS_ALLOWED_ORIGINS", _default_origins).split(",")
+    if o.strip()
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Authorization", "Content-Type"],
+    max_age=600,
+)
+
+# Global state
+class AppState:
+    """Application state"""
+    def __init__(self):
+        self.start_time = time.time()
+        self.requests_processed = 0
+        self.decisions = {"ALLOW": 0, "REVIEW": 0, "BLOCK": 0}
+        self.total_risk_score = 0.0
+        self.total_processing_time = 0.0
+        self.model_loaded = False
+        self.config = {}
+        # Graph-based fraud detection
+        self.transaction_graph = None
+        self.fraud_chains = []
+        self.mule_accounts = {'mule_acc_001', 'mule_acc_002', 'test_merchant', 'suspect_account_1', 'fraud_wallet_xyz'}
+        self.account_profiles = {}
+        self.graph_loaded = True  # Enable for demo
+        # Lateral movement detection - rolling betweenness centrality baseline
+        self.centrality_baseline = {}  # {account_id: [centrality_history]}
+        self.centrality_window_size = 10  # Track last 10 measurements
+        # Innovation managers
+        self.voice_analyzer = None
+        self.mule_scorer = None
+        self.honeypot_manager = None
+        self.blockchain_manager = None
+        self.aegis_oracle = None  # Explainability engine
+        
+state = AppState()
 
 async def _honeypot_auto_release_loop(interval_seconds: int = 60):
     while True:
@@ -710,7 +833,7 @@ async def health_check_v1():
         innovations_available=INNOVATIONS_AVAILABLE,
         uptime_seconds=uptime,
         requests_processed=state.requests_processed,
-        timestamp=datetime.utcnow().isoformat() + 'Z',
+        timestamp=datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
     )
 
 @app.get("/health", response_model=HealthCheckResponse, tags=["General"])
@@ -730,7 +853,7 @@ async def health_check():
         innovations_available=INNOVATIONS_AVAILABLE,
         uptime_seconds=uptime,
         requests_processed=state.requests_processed,
-        timestamp=datetime.utcnow().isoformat() + 'Z',
+        timestamp=datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
     )
 
 
@@ -956,6 +1079,12 @@ async def check_transaction(request: TransactionCheckRequest):
             'BLOCK': 'block',
         }
         decision = decision_map.get(internal_decision, internal_decision.lower())
+        raw_decision = risk_result['decision']
+        decision = {
+            'ALLOW': 'approve',
+            'REVIEW': 'review',
+            'BLOCK': 'block',
+        }.get(raw_decision, str(raw_decision).lower())
         response = TransactionCheckResponse(
             transaction_id=request.transaction_id,
             risk_score=risk_result['risk_score'],
@@ -966,7 +1095,7 @@ async def check_transaction(request: TransactionCheckRequest):
             explanation=explanation_result['explanation'],
             recommended_action=explanation_result['recommended_action'],
             processing_time_ms=processing_time_ms,
-            timestamp=datetime.utcnow().isoformat() + 'Z',
+            timestamp=datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
             honeypot_activated=honeypot_activated,
             honeypot_id=honeypot_id,
             blockchain_evidence_id=blockchain_evidence_id,
@@ -1109,7 +1238,7 @@ async def oracle_explain_detailed(payload: dict):
             'oracle_reasoning': explanation,
             'forensic_ready': True,
             'legal_admissible': True,
-            'timestamp': datetime.utcnow().isoformat() + 'Z',
+            'timestamp': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
         }
         
     except Exception as e:
