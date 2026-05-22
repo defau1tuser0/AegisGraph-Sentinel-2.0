@@ -31,6 +31,7 @@ import json
 import networkx as nx
 import numpy as np
 
+from ..config.validation import validate_environment
 from .schemas import (
     TransactionCheckRequest,
     TransactionCheckResponse,
@@ -550,7 +551,10 @@ async def lifespan(app: FastAPI):
     print("=" * 80)
     print("AegisGraph Sentinel 2.0 - Starting up...")
     print("=" * 80)
-    
+
+    # Validate environment variables
+    validate_environment()
+
     # Load configuration
     config_path = Path("config/config.yaml")
     if config_path.exists():
