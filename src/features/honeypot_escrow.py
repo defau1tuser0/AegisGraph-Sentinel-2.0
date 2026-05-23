@@ -362,6 +362,8 @@ class HoneypotEscrowManager:
         
         # Move to history
         self.honeypot_history.append(honeypot)
+        if len(self.honeypot_history) > 10000:
+            self.honeypot_history = self.honeypot_history[-5000:]
         del self.active_honeypots[honeypot_id]
         
         return True
@@ -466,6 +468,8 @@ class HoneypotEscrowManager:
         
         # Move to history
         self.honeypot_history.append(honeypot)
+        if len(self.honeypot_history) > 10000:
+            self.honeypot_history = self.honeypot_history[-5000:]
         del self.active_honeypots[honeypot_id]
     
     def get_statistics(self) -> Dict:

@@ -487,6 +487,14 @@ class PredictiveMuleScorer:
         if account_data.referral_code:
             ref = account_data.referral_code
             self.referral_history[ref] = self.referral_history.get(ref, 0) + 1
+
+        # Prevent unbounded memory growth by capping dictionary sizes
+        MAX_HISTORY_SIZE = 10000
+        for history_dict in (self.device_history, self.ip_history, self.referral_history):
+            if len(history_dict) > MAX_HISTORY_SIZE:
+                keys_to_remove = list(history_dict.keys())[:1000]
+                for k in keys_to_remove:
+                    del history_dict[k]
     
     def get_statistics(self) -> Dict[str, int]:
         """Get statistics about recent account openings"""
